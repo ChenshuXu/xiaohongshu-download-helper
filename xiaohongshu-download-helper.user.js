@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         小红书下载助手
 // @namespace    waelun
-// @version      2.1.2
+// @version      2.1.3
 // @author       waelun; maintained by ChenshuXu
 // @description  小红书图片、视频、实况下载（个人维护版）
 // @license      MIT
@@ -21,9 +21,17 @@
 // @require      data:application/javascript,%3Bwindow.Pinia%3DPinia%3B
 // @require      https://cdn.jsdelivr.net/npm/pinia-plugin-persistedstate@4.1.3/dist/index.global.js
 // @connect      *
+// @connect      xhscdn.com
+// @connect      xhscdn.net
+// @connect      xiaohongshu.com
+// @connect      rednotecdn.com
+// @connect      localhost
 // @grant        GM.info
 // @grant        GM_addStyle
 // @grant        GM_xmlhttpRequest
+// @grant        GM_download
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @grant        unsafeWindow
 // @run-at       document-end
 // @downloadURL  https://raw.githubusercontent.com/ChenshuXu/xiaohongshu-download-helper/main/xiaohongshu-download-helper.user.js
@@ -11909,49 +11917,111 @@ $.<序号>$
         exports2.filetypeextension = filetypeextension;
       })(dist);
       const filetypeinfo = /* @__PURE__ */ getDefaultExportFromCjs(dist);
-      async function downloadLargeFile(url, fileName) {
-        console.log("开始下载", fileName, url);
+      const downloadHistoryKey = "xhs-download-script-completed-v1";
+      const completedDownloads = vue.reactive(new Set(GM_getValue(downloadHistoryKey, [])));
+      function rememberDownload(key) {
+        completedDownloads.add(key);
+        // Keep recent completions across refreshes and browser restarts.
+        while (completedDownloads.size > 2000) {
+          completedDownloads.delete(completedDownloads.values().next().value);
+        }
         try {
-          const response = await fetch(url);
-          if (!response.ok) {
-            throw new Error(`Failed to fetch file: ${response.statusText}`);
-          }
-          const blob = await response.blob();
-          const blobUrl = URL.createObjectURL(blob);
-          const link = document.createElement("a");
-          link.href = blobUrl;
-          link.download = fileName;
-          link.style.display = "none";
-          document.body.appendChild(link);
-          link.click();
-          link.remove();
-          setTimeout(() => URL.revokeObjectURL(blobUrl), 6e4);
-          console.log(`${fileName} downloaded successfully!`);
+          GM_setValue(downloadHistoryKey, [...completedDownloads]);
         } catch (error) {
-          console.error("Error during download:", error);
-          throw error;
+          console.error("保存下载记录失败", error);
+          ElMessage.warning("文件已下载，但下载记录保存失败；刷新后可能重复下载");
         }
       }
-      async function getFileExtensionFromPartialContent(url) {
-        try {
-          const response = await fetch(url, {
-            headers: {
-              Range: "bytes=0-1024"
-              // 只请求前 1024 字节
-            }
+      function getDownloadError(error) {
+        const reasons = {
+          not_enabled: "请在 Tampermonkey 设置中启用下载功能，并选择浏览器 API 模式",
+          not_permitted: "请在 Tampermonkey 中允许下载权限",
+          not_whitelisted: "请在 Tampermonkey 的下载设置中允许该文件后缀",
+          not_supported: "当前脚本管理器不支持下载，请使用 Tampermonkey 的浏览器 API 模式"
+        };
+        if (/USER_CANCEL(?:ED|LED)/i.test(JSON.stringify(error && error.details || ""))) {
+          return Object.assign(new Error("下载已取消"), { retryable: false });
+        }
+        const code = error && error.error;
+        const message = reasons[code] || (error && error.message) || code || "下载失败";
+        return Object.assign(new Error(message), { retryable: !reasons[code] });
+      }
+      function downloadLargeFile(url, fileName) {
+        return new Promise((resolve, reject) => {
+          if (typeof GM_download !== "function") {
+            reject(getDownloadError({ error: "not_supported" }));
+            return;
+          }
+          GM_download({
+            url,
+            name: fileName.replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_"),
+            saveAs: false,
+            onload: resolve,
+            onerror: (error) => reject(getDownloadError(error)),
+            ontimeout: () => reject(new Error("下载超时"))
           });
-          if (!response.ok) {
-            throw new Error(`请求失败，状态码：${response.status}`);
-          }
-          const buffer = await response.arrayBuffer();
-          const fileType = filetypeinfo(new Uint8Array(buffer));
-          const sub = "." + fileType[0].extension;
-          return sub;
-        } catch (error) {
-          throw new Error("文件名推断请求出错: ");
-        }
+        });
       }
-      const _hoisted_1$3 = { class: "download-container" };
+      function getFileExtensionFromPartialContent(url) {
+        return new Promise((resolve, reject) => {
+          _GM_xmlhttpRequest({
+            method: "GET",
+            url,
+            headers: { Range: "bytes=0-1023" },
+            responseType: "arraybuffer",
+            timeout: 2e4,
+            onload(response) {
+              if (response.status < 200 || response.status >= 300) {
+                reject(new Error(`资源请求失败：HTTP ${response.status}`));
+                return;
+              }
+              try {
+                const type = filetypeinfo(new Uint8Array(response.response)).find((item) =>
+                  /^(image|video)\//.test(item.mime || "") && item.extension
+                );
+                if (!type) throw new Error("资源未返回可识别的图片或视频");
+                resolve("." + type.extension.replace(/^\./, ""));
+              } catch (error) {
+                reject(error);
+              }
+            },
+            onerror: () => reject(new Error("资源连接失败")),
+            ontimeout: () => reject(new Error("资源请求超时")),
+            onabort: () => reject(new Error("资源请求已取消"))
+          });
+        });
+      }
+      async function runDownloadBatch(list, onProgress, wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))) {
+        const result = { completed: [], failed: [], skipped: 0 };
+        for (const item of list) {
+          if (completedDownloads.has(item.key)) {
+            result.skipped++;
+            continue;
+          }
+          for (let attempt = 0; attempt < 4; attempt++) {
+            onProgress(item, attempt, result);
+            try {
+              const urls = item.getUrls();
+              const url = urls[attempt % urls.length];
+              if (!url) throw new Error("未找到可下载的资源地址");
+              const extension = await getFileExtensionFromPartialContent(url);
+              await downloadLargeFile(url, item.name + extension);
+              rememberDownload(item.key);
+              result.completed.push(item);
+              break;
+            } catch (error) {
+              console.error(`第 ${item.index + 1} 项下载失败（第 ${attempt + 1} 次）`, error);
+              if (error.retryable === false || attempt === 3) {
+                result.failed.push({ item, error });
+                break;
+              }
+              await wait(1000 * 2 ** attempt);
+            }
+          }
+        }
+        return result;
+      }
+      const _hoisted_1$3 = { class: "download-container", style: "display:flex;flex-direction:column;gap:8px;min-height:0" };
       const _hoisted_2$2 = { class: "download-container_top" };
       const _hoisted_3$1 = { class: "item" };
       const _hoisted_4 = ["src"];
@@ -11992,7 +12062,9 @@ $.<序号>$
           const noteStore = useNoteStore();
           const state = vue.reactive({
             checkList: [],
-            title: ""
+            title: "",
+            downloading: false,
+            downloadStatus: ""
           });
           const checkAll = vue.computed(() => {
             var _a2, _b;
@@ -12019,13 +12091,6 @@ $.<序号>$
               }
             }
           }
-          function getDonwloadItemList() {
-            var _a2;
-            const list = (_a2 = noteStore == null ? void 0 : noteStore.note) == null ? void 0 : _a2.image_list.filter((_, index) => {
-              return state.checkList.includes(index);
-            });
-            return list;
-          }
           const activeTab = vue.ref("normal");
           vue.watch(
             [
@@ -12047,126 +12112,117 @@ $.<序号>$
             var _a2, _b, _c, _d;
             state.title = ((_b = (_a2 = noteStore == null ? void 0 : noteStore.note) == null ? void 0 : _a2.title) == null ? void 0 : _b.slice(0, 220)) || ((_d = (_c = noteStore == null ? void 0 : noteStore.note) == null ? void 0 : _c.desc) == null ? void 0 : _d.slice(0, 220)) || "";
             handleCheckAllChange(true);
+            if (!state.downloading) state.downloadStatus = "";
           }
           function handleDownloadFormatChnage(e, type) {
             console.log("修改下载格式", e);
             settingStorageStore.DownloadFormatObj[type] = e;
           }
           async function getDownloadUrlList() {
-            var _a2, _b, _c, _d, _e, _f, _g;
-            const list = getDonwloadItemList();
-            if (!(list == null ? void 0 : list.length)) return [];
-            const { useNameAsDir, useTitleAsDir } = settingStorageStore;
-            const resList = [];
-            const notePublishTime = formatTime(
-              (_a2 = noteStore.note) == null ? void 0 : _a2.time,
-              settingStorageStore.timeFormatRule
-            );
-            let redId = await getRedId();
-            const len = activeTab.value == "normal" ? list.length : 1;
-            for (let index = 0; index < len; index++) {
-              const item = list[index];
-              let url = getDownloadUrl(item);
-              let sub = "";
-              let dir = "";
-              let name = "";
-              if (useNameAsDir && ((_b = noteStore.note) == null ? void 0 : _b.user.nickname)) {
-                dir += ((_c = noteStore == null ? void 0 : noteStore.note) == null ? void 0 : _c.user.nickname) + "/";
-              }
-              if (useTitleAsDir && state.title) {
-                dir += state.title + "/";
-              }
-              try {
-                sub = await getFileExtensionFromPartialContent(url);
-              } catch (error) {
-                console.log("文件名推断出错了");
-                try {
-                  console.log("再次推断");
-                  const urlArr = url.split("/");
-                  urlArr[2] += "/notes_pre_post";
-                  url = urlArr.join("/");
-                  sub = await getFileExtensionFromPartialContent(url);
-                } catch (error2) {
-                  console.log("推断再次出错");
-                }
-              }
-              name = getFileNameByNamingRule(
-                {
-                  index: index + 1,
-                  title: state.title,
-                  ipLocation: (_d = noteStore.note) == null ? void 0 : _d.ip_location,
-                  nickname: (_e = noteStore.note) == null ? void 0 : _e.user.nickname,
-                  noteId: (_f = noteStore.note) == null ? void 0 : _f.note_id,
-                  publishTime: notePublishTime,
-                  userId: (_g = noteStore.note) == null ? void 0 : _g.user.user_id,
-                  redId
-                },
-                settingStorageStore.nameRule,
-                list.length <= 1
-              ) + sub;
-              resList.push({
-                name,
-                url,
-                dir,
-                file: item
-              });
-            }
-            return resList;
+            // Snapshot before the first await: changing notes/settings must not mix batches.
+            const note = noteStore.note;
+            if (!note.note_id) return [];
+            const tab = activeTab.value;
+            const title = state.title;
+            const { useNameAsDir, useTitleAsDir, nameRule, timeFormatRule, preferLive } = settingStorageStore;
+            const downloadFormat = settingStorageStore.DownloadFormatObj[tab];
+            const selected = tab === "normal"
+              ? (note.image_list || []).map((file, index) => ({ file, index })).filter(({ index }) => state.checkList.includes(index))
+              : [{ file: {}, index: 0 }];
+            if (!selected.length) return [];
+            const notePublishTime = formatTime(note.time, timeFormatRule);
+            const redId = await getRedId();
+            const dir = (useNameAsDir && note.user.nickname ? note.user.nickname + "/" : "") + (useTitleAsDir && title ? title + "/" : "");
+            return selected.map(({ file, index }) => ({
+              key: [note.note_id, tab, index, downloadFormat, !!(tab === "normal" && file.live_photo && preferLive)].join(":"),
+              noteId: note.note_id,
+              index,
+              name: getFileNameByNamingRule({
+                index: index + 1,
+                title,
+                ipLocation: note.ip_location,
+                nickname: note.user.nickname,
+                noteId: note.note_id,
+                publishTime: notePublishTime,
+                userId: note.user.user_id,
+                redId
+              }, nameRule, tab !== "normal" || note.image_list.length <= 1),
+              dir,
+              getUrls: () => getDownloadUrls(file, { note, tab, downloadFormat, preferLive })
+            }));
           }
-          function getDownloadUrl(file) {
-            var _a2, _b;
-            if (!((_a2 = noteStore.note) == null ? void 0 : _a2.note_id)) return;
-            (_b = noteStore.note) == null ? void 0 : _b.type;
-            const downloadFormat = settingStorageStore.DownloadFormatObj[activeTab.value];
-            const preferLive = settingStorageStore.preferLive;
-            let url = "";
-            let data = null;
-            if (activeTab.value == "normal") {
+          function getDownloadUrls(file, { note, tab, downloadFormat, preferLive }) {
+            const uniqueUrls = (urls) => [...new Set(urls.filter(Boolean).map((url) => url.replace(/^http:/, "https:")))];
+            const streamUrls = (stream = {}) => {
+              const items = [stream.h265, stream.h264, stream.av1, ...Object.values(stream)].find((items) => Array.isArray(items) && items.length) || [];
+              return items.flatMap((item) => [item.master_url, item.masterUrl, ...(item.backup_urls || item.backupUrls || [])]).filter(Boolean);
+            };
+            let urls;
+            if (tab === "normal") {
+              const liveUrls = file.live_photo && preferLive ? streamUrls(file.stream) : [];
+              if (liveUrls.length) return uniqueUrls(liveUrls);
+              if (downloadFormat === DownloadFormat.default && !(file.live_photo && preferLive)) return uniqueUrls([file.url_default]);
               const url2 = file.url_default;
-              const key = (url2.match(fileKeyReg) || [new URL(url2).pathname.split("/").filter(Boolean).pop().split("!")[0]])[0];
-              const liveStream = (file == null ? void 0 : file.stream) && (file.stream.h264 || file.stream.h265 || file.stream.av1 || file.stream._e_f4 || file.stream.EF4);
-              data = {
-                url: url2,
-                originUrl: getRandomItemFromArray(imageRequestBaseUrl) + key,
-                liveUrl: (file == null ? void 0 : file.live_photo) && liveStream && liveStream[0] ? liveStream[0].master_url || liveStream[0].masterUrl || "" : ""
-              };
+              const key = file.file_id || (url2.match(fileKeyReg) || [new URL(url2).pathname.split("/").filter(Boolean).pop().split("!")[0]])[0];
+              urls = imageRequestBaseUrl.map((base, index) => base + (index >= 2 && !key.includes("/") ? "notes_pre_post/" : "") + key);
+              if (downloadFormat === DownloadFormat.jpg && !(file.live_photo && preferLive)) urls = urls.map((url) => url + jpgQueryParams);
             } else {
-              const video = noteStore.note && noteStore.note.video;
-              const stream = video && video.media && video.media.stream || {};
-              const streamList = [stream.h265, stream.h264, stream.av1].find((items) => Array.isArray(items) && items.length) || Object.values(stream).find((items) => Array.isArray(items) && items.length);
-              const streamItem = streamList && streamList[0];
-              const videoUrl = streamItem && (streamItem.master_url || streamItem.masterUrl || streamItem.backup_urls && streamItem.backup_urls[0] || streamItem.backupUrls && streamItem.backupUrls[0]) || "";
-              const consumer = video && video.consumer;
-              const originVideoKey = consumer && (consumer.origin_video_key || consumer.originVideoKey);
-              data = {
-                url: videoUrl,
-                originUrl: originVideoKey ? getRandomItemFromArray(videoRequestBaseUrl) + originVideoKey : videoUrl
-              };
-              console.log("下载数据", data);
+              const video = note.video || {};
+              const consumer = video.consumer || {};
+              const key = consumer.origin_video_key || consumer.originVideoKey;
+              urls = downloadFormat === DownloadFormat.origin && key
+                ? videoRequestBaseUrl.map((base) => base + key)
+                : streamUrls(video.media && video.media.stream);
             }
-            if (downloadFormat == DownloadFormat.default) {
-              url = data.url;
-            } else if (downloadFormat == DownloadFormat.origin) {
-              url = data.originUrl;
-            } else if (downloadFormat == DownloadFormat.jpg) {
-              url = data.originUrl + jpgQueryParams;
-            }
-            if (file.live_photo && preferLive) {
-              url = data.liveUrl || data.originUrl;
-            }
-            return url;
+            return uniqueUrls(urls);
           }
           async function downLoad(useAria2 = false) {
-            const list = await getDownloadUrlList();
-            if (!useAria2) {
-              list == null ? void 0 : list.forEach((item) => {
-                downloadLargeFile(item.url, item.name);
+            if (state.downloading) return;
+            state.downloading = true;
+            state.downloadStatus = "正在准备下载…";
+            try {
+              const list = await getDownloadUrlList();
+              if (!list.length) {
+                state.downloadStatus = "请先选择要下载的文件";
+                return;
+              }
+              if (useAria2) {
+                const prepared = [];
+                for (const item of list) {
+                  const url = item.getUrls()[0];
+                  const extension = await getFileExtensionFromPartialContent(url);
+                  prepared.push({ ...item, url, name: item.name + extension });
+                }
+                await reqAria2Download(prepared);
+                state.downloadStatus = "aria2 请求已处理，请在 aria2 中查看下载结果";
+                return;
+              }
+              const result = await runDownloadBatch(list, (item, attempt, result) => {
+                state.downloadStatus = `已完成 ${result.completed.length + result.skipped}/${list.length}；正在下载第 ${item.index + 1} 项${attempt ? `（自动重试 ${attempt}/3）` : ""}`;
               });
-            } else if (useAria2) {
-              reqAria2Download(list);
+              const summary = `本次下载完成 ${result.completed.length} 项，跳过已完成 ${result.skipped} 项，失败 ${result.failed.length} 项`;
+              state.downloadStatus = summary;
+              if (result.failed.length) {
+                state.downloadStatus += `。失败序号：${result.failed.map(({ item }) => item.index + 1).join("、")}。${result.failed[0].error.message}；再次点击只会补下载未完成项。`;
+                ElMessage.warning(summary);
+              } else {
+                ElMessage.success(summary);
+              }
+            } catch (error) {
+              state.downloadStatus = `下载未完成：${error.message}`;
+              ElMessage.error(state.downloadStatus);
+            } finally {
+              state.downloading = false;
             }
-            ElMessage.success("已开始下载");
-            props.closeDialog();
+          }
+          function clearDownloadHistory() {
+            if (state.downloading || !noteStore.note.note_id) return;
+            const prefix = noteStore.note.note_id + ":";
+            for (const key of completedDownloads) {
+              if (key.startsWith(prefix)) completedDownloads.delete(key);
+            }
+            GM_setValue(downloadHistoryKey, [...completedDownloads]);
+            state.downloadStatus = "已清除本篇下载记录，可以重新下载文件";
           }
           return (_ctx, _cache) => {
             const _component_el_checkbox = ElCheckbox;
@@ -12181,8 +12237,23 @@ $.<序号>$
             const _component_el_tab_pane = ElTabPane;
             const _component_el_tabs = ElTabs;
             return vue.openBlock(), vue.createElementBlock("div", _hoisted_1$3, [
+              vue.createElementVNode("p", {
+                role: "status",
+                "aria-live": "polite",
+                style: "margin:0;line-height:1.6;overflow-wrap:anywhere;flex-shrink:0"
+              }, vue.toDisplayString(state.downloadStatus || "下载失败会自动重试，已完成的文件会自动跳过。"), 1),
+              vue.createVNode(_component_el_button, {
+                size: "small",
+                style: "align-self:flex-start;flex-shrink:0",
+                disabled: state.downloading,
+                onClick: clearDownloadHistory
+              }, {
+                default: vue.withCtx(() => [vue.createTextVNode("清除本篇下载记录（允许重新下载）")]),
+                _: 1
+              }, 8, ["disabled"]),
               vue.createVNode(_component_el_tabs, {
                 type: "border-card",
+                style: "flex:1;min-height:0;height:auto",
                 modelValue: vue.unref(activeTab),
                 "onUpdate:modelValue": _cache[11] || (_cache[11] = ($event) => vue.isRef(activeTab) ? activeTab.value = $event : null)
               }, {
@@ -12322,17 +12393,18 @@ $.<序号>$
                               vue.createVNode(_component_el_button, {
                                 type: "primary",
                                 onClick: _cache[5] || (_cache[5] = ($event) => downLoad()),
-                                disabled: vue.unref(state).checkList.length == 0
+                                loading: state.downloading,
+                                disabled: state.downloading || vue.unref(state).checkList.length == 0
                               }, {
                                 default: vue.withCtx(() => _cache[16] || (_cache[16] = [
                                   vue.createTextVNode(" 浏览器下载 ")
                                 ])),
                                 _: 1
-                              }, 8, ["disabled"]),
+                              }, 8, ["disabled", "loading"]),
                               vue.createVNode(_component_el_button, {
                                 color: "#3f85ff",
                                 onClick: _cache[6] || (_cache[6] = ($event) => downLoad(true)),
-                                disabled: vue.unref(state).checkList.length == 0
+                                disabled: state.downloading || vue.unref(state).checkList.length == 0
                               }, {
                                 default: vue.withCtx(() => _cache[17] || (_cache[17] = [
                                   vue.createTextVNode(" aria2下载 ")
@@ -12421,22 +12493,25 @@ $.<序号>$
                             vue.createElementVNode("div", _hoisted_15, [
                               vue.createVNode(_component_el_button, {
                                 type: "primary",
-                                onClick: _cache[9] || (_cache[9] = ($event) => downLoad())
+                                onClick: _cache[9] || (_cache[9] = ($event) => downLoad()),
+                                loading: state.downloading,
+                                disabled: state.downloading
                               }, {
                                 default: vue.withCtx(() => _cache[21] || (_cache[21] = [
                                   vue.createTextVNode(" 浏览器下载 ")
                                 ])),
                                 _: 1
-                              }),
+                              }, 8, ["loading", "disabled"]),
                               vue.createVNode(_component_el_button, {
                                 color: "#3f85ff",
-                                onClick: _cache[10] || (_cache[10] = ($event) => downLoad(true))
+                                onClick: _cache[10] || (_cache[10] = ($event) => downLoad(true)),
+                                disabled: state.downloading
                               }, {
                                 default: vue.withCtx(() => _cache[22] || (_cache[22] = [
                                   vue.createTextVNode(" aria2下载 ")
                                 ])),
                                 _: 1
-                              })
+                              }, 8, ["disabled"])
                             ])
                           ])) : vue.createCommentVNode("", true)
                         ];
