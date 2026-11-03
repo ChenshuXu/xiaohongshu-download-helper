@@ -29,7 +29,7 @@ function harness(options = {}) {
   };
   const downloads = [], probes = [], messages = [], writes = [], waits = [];
   const context = vm.createContext({
-    console: { error() {}, log() {} }, URL, Uint8Array, setTimeout,
+    console: { error() {}, log() {} }, URL, Uint8Array, TextEncoder, setTimeout,
     vue: {
       reactive: (value) => value,
       ref: (value) => ({ value }),
@@ -62,7 +62,7 @@ function harness(options = {}) {
       ${setup}
       return { state, activeTab, getDownloadUrlList, getDownloadUrls, downLoad, clearDownloadHistory };
     })();
-    globalThis.api = { ...api, runDownloadBatch, downloadLargeFile, getFileExtensionFromPartialContent, completedDownloads };
+    globalThis.api = { ...api, runDownloadBatch, downloadLargeFile, getFileExtensionFromPartialContent, completedDownloads, getFileNameByNamingRule, defaultFileNameRule };
   `, context);
   return {
     ...context.api, store, settings, downloads, probes, messages, writes, context, waits,
@@ -146,6 +146,64 @@ test("partial selection keeps original photo numbers and distinct format complet
   assert.equal((await h.getDownloadUrlList())[0].name, "note-a.3");
   h.settings.DownloadFormatObj.normal = 2;
   assert.notEqual((await h.getDownloadUrlList())[0].key, partial[0].key);
+});
+
+test("long Chinese titles are capped while timestamps and six original photo numbers survive", async () => {
+  const h = harness();
+  h.settings.nameRule = h.defaultFileNameRule;
+  h.state.title = "很长的中文标题和日落照片🌅".repeat(20);
+  h.store.note.image_list.push({ url_default: "https://cdn.example/image-5!preview" });
+  h.state.checkList = [0, 1, 2, 3, 4, 5];
+  const list = await h.getDownloadUrlList();
+  await h.runDownloadBatch(list, () => {}, h.wait);
+  assert.equal(new Set(h.downloads.map(({ name }) => name)).size, 6);
+  h.downloads.forEach(({ name }, index) => {
+    assert.ok(name.startsWith("[作者][123]"), name);
+    assert.ok(!name.includes(h.state.title), name);
+    assert.ok(name.includes(Array.from(h.state.title).slice(0, 40).join("")), name);
+    assert.ok(name.endsWith(`(2026).${index + 1}.jpg`), name);
+    assert.ok(Buffer.byteLength(name, "utf8") <= 200, name);
+    assert.ok(!name.includes("\ufffd"));
+  });
+  assert.equal(h.state.title, "很长的中文标题和日落照片🌅".repeat(20));
+  h.state.checkList = [4];
+  assert.equal((await h.getDownloadUrlList())[0].name, list[4].name);
+});
+
+test("custom layouts keep their sequence location, and missing sequences are added for multiple photos", () => {
+  const h = harness();
+  const data = { index: 12, title: "标题🌅".repeat(100), nickname: "作者", publishTime: "2026-11-02" };
+  const prefix = h.getFileNameByNamingRule(data, "$<序号>.$[<发布者昵称>]<标题>(<发布时间>)");
+  assert.ok(prefix.startsWith("12.[作者]"));
+  assert.ok(prefix.endsWith("(2026-11-02)"));
+  const suffix = h.getFileNameByNamingRule(data, "<标题>");
+  assert.ok(suffix.endsWith(".12"));
+  assert.ok(!prefix.includes(data.title));
+  assert.ok(!suffix.includes(data.title));
+  assert.ok(Buffer.byteLength(prefix + ".jpeg", "utf8") <= 200);
+  assert.ok(Buffer.byteLength(suffix + ".jpeg", "utf8") <= 200);
+  const single = h.getFileNameByNamingRule(data, "<标题>$.<序号>$", true);
+  assert.ok(!single.endsWith(".12"));
+});
+
+test("short names remain unchanged and oversized fields cannot truncate the original sequence", () => {
+  const h = harness();
+  const data = { index: 3, title: "相册", nickname: "作者", redId: "123", publishTime: "2026" };
+  assert.equal(h.getFileNameByNamingRule(data, h.defaultFileNameRule), "[作者][123]相册(2026).3");
+  data.nickname = "超长作者🌅".repeat(100);
+  data.title = "标题".repeat(100);
+  const result = h.getFileNameByNamingRule(data, h.defaultFileNameRule);
+  assert.ok(result.endsWith("(2026).3"));
+  assert.ok(Buffer.byteLength(result + ".jpeg", "utf8") <= 200);
+});
+
+test("the title limit counts Unicode code points and is also applied to single-photo names", () => {
+  const h = harness();
+  const data = { index: 1, title: "🌅".repeat(41) };
+  const name = h.getFileNameByNamingRule(data, "<标题>$.<序号>$", true);
+  assert.equal(name, "🌅".repeat(40));
+  assert.equal(Array.from(name).length, 40);
+  assert.equal(data.title, "🌅".repeat(41));
 });
 
 test("changing the note, title, selection or settings during preparation does not mix a batch", async () => {

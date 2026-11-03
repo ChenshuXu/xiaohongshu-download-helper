@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         小红书下载助手
 // @namespace    waelun
-// @version      2.1.3
+// @version      2.1.4
 // @author       waelun; maintained by ChenshuXu
 // @description  小红书图片、视频、实况下载（个人维护版）
 // @license      MIT
@@ -10293,18 +10293,44 @@ $.<序号>$
         发布者id: "userId"
       };
       function getFileNameByNamingRule(nameData, nameRule, noSequence = false) {
-        let res = nameRule.replaceAll("\n", "");
-        Object.entries(globalFileNameVarMap).forEach(([key, value]) => {
-          let globalKeyRegExp = new RegExp(`<${key}>`, "g");
-          res = res.replaceAll(/\$.*?\$/g, (val) => {
-            if (val.includes("序号") && noSequence) {
-              val = "";
-            }
-            return val.replaceAll("$", "");
-          });
-          res = res.replace(globalKeyRegExp, nameData[value] + "");
+        const rule = nameRule.replaceAll("\n", "").replace(/\$.*?\$/g, (part) =>
+          noSequence && part.includes("<序号>") ? "" : part.replaceAll("$", "")
+        );
+        const tokens = new Map(Object.entries(globalFileNameVarMap).map(([label, key]) => [`<${label}>`, key]));
+        const parts = rule.split(/(<[^<>]+>)/g).map((part) => {
+          const key = tokens.get(part);
+          let value = sanitizeFileName(key ? nameData[key] : part);
+          if (key === "title") value = Array.from(value).slice(0, 40).join("");
+          return { key: key || "literal", value };
         });
-        return res;
+        if (!noSequence && !rule.includes("<序号>")) {
+          parts.push({ key: "index", value: "." + nameData.index });
+        }
+        // Keep the stem within 184 UTF-8 bytes, leaving room for its extension.
+        // Shorten text fields before the timestamp or original photo number.
+        const encoder = new TextEncoder();
+        let excess = parts.reduce((size, part) => size + encoder.encode(part.value).length, 0) - 184;
+        for (const key of ["title", "nickname", "ipLocation", "redId", "userId", "noteId", "literal", "publishTime"]) {
+          for (const part of parts.filter((part) => part.key === key)) {
+            if (excess <= 0) break;
+            const oldSize = encoder.encode(part.value).length;
+            const budget = Math.max(0, oldSize - excess);
+            let shortened = "";
+            let size = 0;
+            for (const character of part.value) {
+              const bytes = encoder.encode(character).length;
+              if (size + bytes > budget) break;
+              shortened += character;
+              size += bytes;
+            }
+            part.value = shortened;
+            excess -= oldSize - size;
+          }
+        }
+        return parts.map((part) => part.value).join("");
+      }
+      function sanitizeFileName(value) {
+        return String(value).normalize("NFC").replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_");
       }
       async function getRedId() {
         var _a2;
@@ -11954,7 +11980,7 @@ $.<序号>$
           }
           GM_download({
             url,
-            name: fileName.replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_"),
+            name: sanitizeFileName(fileName),
             saveAs: false,
             onload: resolve,
             onerror: (error) => reject(getDownloadError(error)),
